@@ -54,6 +54,43 @@ response = client.chat.completions.create(
 )
 ```
 
+## Prompt Management — Versioned Templates
+
+Store prompt templates server-side and reference them by slug. Variables
+interpolate at request time, every version is audit-logged, and you can
+roll back without touching app code.
+
+```python
+# Create (needs admin_key)
+admin = Summoned(api_key="sk-smnd-...", admin_key="your-admin-key")
+
+admin.admin.prompts.create(
+    slug="customer-support",
+    tenant_id="default",
+    template=[
+        {"role": "system", "content": "You are a {{tone}} support agent."},
+        {"role": "user",   "content": "{{user_question}}"},
+    ],
+    variables={"tone": "friendly"},
+    default_model="openai/gpt-4o",
+)
+
+# Use — prompt_id + prompt_variables are first-class kwargs
+response = client.chat.completions.create(
+    prompt_id="customer-support",                                 # or "customer-support@3"
+    prompt_variables={"user_question": "Where's my order?"},
+)
+
+# Manage
+admin.admin.prompts.list(tenant_id="default")
+admin.admin.prompts.get("customer-support", tenant_id="default")  # or admin.admin.prompts.get("prm_abc123")
+admin.admin.prompts.versions("customer-support", tenant_id="default")
+admin.admin.prompts.delete("prm_abc123")
+```
+
+When a prompt has a ``default_model``, ``model=`` on
+``chat.completions.create`` is optional. Caller-supplied ``model`` always wins.
+
 ## `with_config` — Reusable Client Configuration
 
 ```python

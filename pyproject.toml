@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "summoned-ai"
-version = "0.1.0"
+version = "0.2.0"
 description = "Summoned AI Gateway SDK — OpenAI-compatible Python client with routing, caching, guardrails, and multi-provider support"
 readme = "README.md"
 license = "MIT"

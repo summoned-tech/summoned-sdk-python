@@ -36,7 +36,7 @@ __all__ = [
 ]
 
 DEFAULT_BASE_URL = "http://localhost:4000"
-SDK_VERSION = "0.1.0"
+SDK_VERSION = "0.2.0"
 
 logger = logging.getLogger("summoned_ai")
 
@@ -194,6 +194,26 @@ class _BaseClient:
 # Sync chat completions
 # ---------------------------------------------------------------------------
 
+def _merge_prompt_into_config(
+    config: Optional[Dict[str, Any]],
+    prompt_id: Optional[str],
+    prompt_variables: Optional[Dict[str, str]],
+) -> Optional[Dict[str, Any]]:
+    """Merge ``prompt_id`` / ``prompt_variables`` kwargs into the config dict.
+
+    Uses camelCase wire keys (``promptId``, ``promptVariables``) so the JSON
+    payload is identical to what the TypeScript SDK sends.
+    """
+    if prompt_id is None and prompt_variables is None:
+        return config
+    merged = dict(config or {})
+    if prompt_id is not None:
+        merged["promptId"] = prompt_id
+    if prompt_variables is not None:
+        merged["promptVariables"] = prompt_variables
+    return merged
+
+
 class _ChatCompletions:
     def __init__(self, client: "Summoned"):
         self._client = client
@@ -201,8 +221,8 @@ class _ChatCompletions:
     def create(
         self,
         *,
-        model: str,
-        messages: List[Dict[str, Any]],
+        model: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
         stream: bool = False,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
@@ -211,10 +231,19 @@ class _ChatCompletions:
         top_p: Optional[float] = None,
         stop: Optional[Union[str, List[str]]] = None,
         fallback_models: Optional[List[str]] = None,
+        prompt_id: Optional[str] = None,
+        prompt_variables: Optional[Dict[str, str]] = None,
         config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Union[Dict[str, Any], Iterator[Dict[str, Any]]]:
-        body: Dict[str, Any] = {"model": model, "messages": messages}
+        """Create a chat completion.
+
+        When ``prompt_id`` is set, the server-side prompt template is
+        interpolated with ``prompt_variables`` and prepended to ``messages``.
+        If the prompt row has a ``defaultModel``, ``model`` may be omitted
+        (pass ``""`` or leave unset).
+        """
+        body: Dict[str, Any] = {"model": model, "messages": messages or []}
         if stream:
             body["stream"] = True
         if temperature is not None:
@@ -232,6 +261,8 @@ class _ChatCompletions:
         if fallback_models:
             body["fallback_models"] = fallback_models
         body.update(kwargs)
+
+        config = _merge_prompt_into_config(config, prompt_id, prompt_variables)
 
         if stream:
             return self._client._stream("/v1/chat/completions", body, config)
@@ -321,10 +352,71 @@ class _AdminProviders:
         return self._client._request("GET", "/admin/providers", use_admin_auth=True)
 
 
+class _AdminPrompts:
+    """Versioned prompt templates. See rfcs/0001-prompt-management.md in the
+    gateway repo for the underlying model."""
+
+    def __init__(self, client: "Summoned"):
+        self._client = client
+
+    def create(
+        self,
+        *,
+        slug: str,
+        tenant_id: str,
+        template: List[Dict[str, Any]],
+        variables: Optional[Dict[str, str]] = None,
+        default_model: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a new prompt version. If a prompt with the same (tenant, slug)
+        exists, the version auto-increments and the new row becomes latest."""
+        body: Dict[str, Any] = {"slug": slug, "tenantId": tenant_id, "template": template}
+        if variables is not None:
+            body["variables"] = variables
+        if default_model is not None:
+            body["defaultModel"] = default_model
+        if description is not None:
+            body["description"] = description
+        return self._client._request("POST", "/admin/prompts", body, use_admin_auth=True)
+
+    def list(self, tenant_id: str) -> Dict[str, Any]:
+        """List the latest version of every prompt for a tenant."""
+        return self._client._request(
+            "GET", f"/admin/prompts?tenantId={tenant_id}", use_admin_auth=True,
+        )
+
+    def get(self, ref: str, *, tenant_id: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch a prompt by primary key (``prm_...``) or by slug.
+
+        When ``ref`` is a slug, ``tenant_id`` is required and the latest
+        version is returned.
+        """
+        if ref.startswith("prm_"):
+            return self._client._request("GET", f"/admin/prompts/{ref}", use_admin_auth=True)
+        if not tenant_id:
+            raise ValueError("tenant_id is required when fetching by slug")
+        return self._client._request(
+            "GET", f"/admin/prompts/by-slug/{ref}?tenantId={tenant_id}", use_admin_auth=True,
+        )
+
+    def versions(self, slug: str, *, tenant_id: str) -> Dict[str, Any]:
+        """Version history for a slug, newest first."""
+        return self._client._request(
+            "GET", f"/admin/prompts/{slug}/versions?tenantId={tenant_id}", use_admin_auth=True,
+        )
+
+    def delete(self, prompt_id: str) -> Dict[str, Any]:
+        """Soft-delete a prompt version. If it was the latest, the next-highest
+        active version is promoted to latest."""
+        return self._client._request("DELETE", f"/admin/prompts/{prompt_id}", use_admin_auth=True)
+
+
 class _Admin:
     def __init__(self, client: "Summoned"):
         self.keys = _AdminKeys(client)
         self.virtual_keys = _AdminVirtualKeys(client)
+        self.prompts = _AdminPrompts(client)
         self.logs = _AdminLogs(client)
         self.stats = _AdminStats(client)
         self.providers = _AdminProviders(client)
@@ -449,17 +541,19 @@ class _AsyncChatCompletions:
     async def create(
         self,
         *,
-        model: str,
-        messages: List[Dict[str, Any]],
+        model: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
         stream: bool = False,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         fallback_models: Optional[List[str]] = None,
+        prompt_id: Optional[str] = None,
+        prompt_variables: Optional[Dict[str, str]] = None,
         config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Union[Dict[str, Any], AsyncIterator[Dict[str, Any]]]:
-        body: Dict[str, Any] = {"model": model, "messages": messages}
+        body: Dict[str, Any] = {"model": model, "messages": messages or []}
         if stream:
             body["stream"] = True
         if temperature is not None:
@@ -471,6 +565,8 @@ class _AsyncChatCompletions:
         if fallback_models:
             body["fallback_models"] = fallback_models
         body.update(kwargs)
+
+        config = _merge_prompt_into_config(config, prompt_id, prompt_variables)
 
         if stream:
             return self._client._stream("/v1/chat/completions", body, config)
@@ -502,6 +598,7 @@ class _AsyncAdmin:
     def __init__(self, client: "AsyncSummoned"):
         self.keys = _AsyncAdminKeys(client)
         self.virtual_keys = _AsyncAdminVirtualKeys(client)
+        self.prompts = _AsyncAdminPrompts(client)
         self.logs = _AsyncAdminLogs(client)
         self.stats = _AsyncAdminStats(client)
         self.providers = _AsyncAdminProviders(client)
@@ -563,6 +660,56 @@ class _AsyncAdminProviders:
 
     async def list(self) -> Dict[str, Any]:
         return await self._client._request("GET", "/admin/providers", use_admin_auth=True)
+
+
+class _AsyncAdminPrompts:
+    """Async mirror of _AdminPrompts."""
+
+    def __init__(self, client: "AsyncSummoned"):
+        self._client = client
+
+    async def create(
+        self,
+        *,
+        slug: str,
+        tenant_id: str,
+        template: List[Dict[str, Any]],
+        variables: Optional[Dict[str, str]] = None,
+        default_model: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"slug": slug, "tenantId": tenant_id, "template": template}
+        if variables is not None:
+            body["variables"] = variables
+        if default_model is not None:
+            body["defaultModel"] = default_model
+        if description is not None:
+            body["description"] = description
+        return await self._client._request("POST", "/admin/prompts", body, use_admin_auth=True)
+
+    async def list(self, tenant_id: str) -> Dict[str, Any]:
+        return await self._client._request(
+            "GET", f"/admin/prompts?tenantId={tenant_id}", use_admin_auth=True,
+        )
+
+    async def get(self, ref: str, *, tenant_id: Optional[str] = None) -> Dict[str, Any]:
+        if ref.startswith("prm_"):
+            return await self._client._request("GET", f"/admin/prompts/{ref}", use_admin_auth=True)
+        if not tenant_id:
+            raise ValueError("tenant_id is required when fetching by slug")
+        return await self._client._request(
+            "GET", f"/admin/prompts/by-slug/{ref}?tenantId={tenant_id}", use_admin_auth=True,
+        )
+
+    async def versions(self, slug: str, *, tenant_id: str) -> Dict[str, Any]:
+        return await self._client._request(
+            "GET", f"/admin/prompts/{slug}/versions?tenantId={tenant_id}", use_admin_auth=True,
+        )
+
+    async def delete(self, prompt_id: str) -> Dict[str, Any]:
+        return await self._client._request(
+            "DELETE", f"/admin/prompts/{prompt_id}", use_admin_auth=True,
+        )
 
 
 # ---------------------------------------------------------------------------
